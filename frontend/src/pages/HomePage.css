@@ -1,6 +1,17 @@
 .home {
+  position: relative;
+  isolation: isolate;
   padding-top: 0;
   padding-bottom: 80px;
+}
+
+/* Keep only the home content area white; other pages continue using the shared background. */
+.home::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  inset: 0 calc(50% - 50vw);
+  background: var(--white);
 }
 
 /*
