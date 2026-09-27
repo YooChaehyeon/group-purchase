@@ -453,8 +453,190 @@ function fileToDataUrl(file) {
 }
 
 /** path/method 를 실제 백엔드 라우팅과 같은 순서로 매칭한다. */
+/**
+ * ── 구글 시트 실시간 반영 ─────────────────────────────────────────────
+ *
+ * "Jungle_공동구매_수집목록" 시트(공동구매 데이터 탭)를 화면이 처음 요청할 때 한 번 읽어와
+ * 위의 SHEET 표 대신 쓴다. 시트를 고치면 코드 수정·재배포 없이 새로고침만으로 반영된다.
+ * (시트가 "링크가 있는 모든 사용자 - 뷰어"로 공유되어 있어야 읽힌다)
+ *
+ * 시트를 못 읽으면(공유 해제, 네트워크 오류 등) 위의 SHEET 표로 그대로 동작한다.
+ * 열은 순서가 아니라 첫 줄의 제목으로 찾으므로, 열을 옮기거나 새로 끼워 넣어도 괜찮다.
+ */
+const SHEET_CSV_URL =
+  'https://docs.google.com/spreadsheets/d/17q0VbqwEDem4ALs9EwEWmu4Z9yzYTD8PQeuAfxJGL9Q/export?format=csv&gid=0'
+
+/** 따옴표·쉼표·줄바꿈이 섞인 CSV 를 행 배열로 바꾼다. */
+function parseCsv(text) {
+  const rows = []
+  let row = []
+  let cell = ''
+  let quoted = false
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (quoted) {
+      if (ch === '"' && text[i + 1] === '"') {
+        cell += '"'
+        i++
+      } else if (ch === '"') {
+        quoted = false
+      } else {
+        cell += ch
+      }
+    } else if (ch === '"') {
+      quoted = true
+    } else if (ch === ',') {
+      row.push(cell)
+      cell = ''
+    } else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && text[i + 1] === '\n') i++
+      row.push(cell)
+      rows.push(row)
+      row = []
+      cell = ''
+    } else {
+      cell += ch
+    }
+  }
+  if (cell !== '' || row.length) {
+    row.push(cell)
+    rows.push(row)
+  }
+  return rows
+}
+
+const pad2 = (n) => String(n).padStart(2, '0')
+
+/** '2026-08-10 10:00', '2026. 8. 20 23:59:00' 같은 여러 표기를 '2026-08-10T10:00:00' 으로 맞춘다. */
+function sheetDate(value) {
+  const m = String(value ?? '').match(/(\d{4})\D+(\d{1,2})\D+(\d{1,2})(?:\D+(\d{1,2}):(\d{2}))?/)
+  if (!m) return null
+  const [, y, mo, d, h = '0', mi = '0'] = m
+  return `${y}-${pad2(mo)}-${pad2(d)}T${pad2(h)}:${pad2(mi)}:00`
+}
+
+const isHttpUrl = (value) => /^https?:\/\//i.test(String(value ?? '').trim())
+
+/** '17,000 ~', '38000~' → 17000, 38000. 숫자가 없으면 null(가격 미정). */
+function sheetPrice(value) {
+  if (isHttpUrl(value)) return null
+  const digits = String(value ?? '').replace(/[^\d]/g, '')
+  return digits ? Number(digits) : null
+}
+
+/** 'link.inpock.co.kr/x' 처럼 주소 앞머리가 빠진 링크도 눌리게 한다. */
+function sheetLink(value) {
+  const v = String(value ?? '').trim()
+  if (!v) return null
+  if (isHttpUrl(v)) return v
+  return /^[\w-]+(\.[\w-]+)+/.test(v) ? `https://${v}` : null
+}
+
+/** 인스타 주소를 비교할 수 있게 ?igsh= 같은 꼬리와 끝 슬래시를 떼어낸다. */
+const normalizeInsta = (url) => String(url ?? '').trim().toLowerCase().split('?')[0].replace(/\/+$/, '')
+
+let nextSellerId = 1000
+
+/** 시트의 인스타 아이디/프로필 URL 로 셀러를 찾고, 처음 보는 셀러면 새로 만든다. */
+function sellerFromSheet(id, profile) {
+  const profileUrl = isHttpUrl(profile) ? profile.trim() : null
+  const key = normalizeInsta(profileUrl)
+  const known = Object.values(SELLERS).find(
+    (s) => (key && normalizeInsta(s.instagramUrl) === key) || s.nickname === id,
+  )
+  if (known) return known
+  const nickname = profileUrl ? profileUrl.split('?')[0].replace(/\/+$/, '').split('/').pop() || id : id
+  const seller = {
+    userId: nextSellerId++,
+    nickname,
+    profileImageUrl: null,
+    instagramUrl: profileUrl ? profileUrl.split('?')[0] : `https://www.instagram.com/${id}/`,
+  }
+  SELLERS[nickname] = seller
+  ALL_USERS.push(seller)
+  return seller
+}
+
+function postsFromSheet(csv) {
+  const [header, ...rows] = parseCsv(csv)
+  const col = (name) => header.findIndex((h) => h.trim() === name)
+  const C = {
+    code: col('공구 ID'),
+    category: col('카테고리'),
+    product: col('상품명'),
+    content: col('상품 설명'),
+    link: col('상품 링크'),
+    start: col('시작 일시'),
+    end: col('종료 일시'),
+    seller: col('인스타 아이디'),
+    profile: col('인스타 프로필 URL'),
+    price: col('가격'),
+    minPrice: col('최소 가격'),
+    event: col('이벤트'),
+  }
+  const imageCols = header
+    .map((h, i) => (h.trim().startsWith('이미지') ? i : -1))
+    .filter((i) => i >= 0)
+  const get = (row, i) => (i >= 0 ? String(row[i] ?? '').trim() : '')
+
+  return rows
+    .filter((row) => get(row, C.product))
+    .map((row, index) => {
+      const postId = index + 1
+      const start = sheetDate(get(row, C.start))
+      const end = sheetDate(get(row, C.end))
+      const code = get(row, C.code) || `GB-${pad2(postId)}`
+      // "가격" 칸에 이미지 주소가 들어간 줄도 있어서, 주소면 사진으로 쓴다.
+      const images = [...imageCols, C.price].map((i) => get(row, i)).filter(isHttpUrl)
+      return {
+        postId,
+        postType: 'SELLER',
+        author: sellerFromSheet(get(row, C.seller), get(row, C.profile)),
+        title: `${get(row, C.product)} 공동구매`,
+        content: get(row, C.content) || '상품 링크 확인 요망',
+        imageUrls: images.length ? [...new Set(images)] : sampleSet(null, code.toLowerCase(), `post-${postId}`),
+        productName: get(row, C.product),
+        price: sheetPrice(get(row, C.minPrice)) ?? sheetPrice(get(row, C.price)),
+        buyUrl: sheetLink(get(row, C.link)),
+        startDate: start,
+        endDate: end,
+        eventNote: get(row, C.event) || null,
+        progress: progressOf(start, end),
+        categories: [categoryByName(get(row, C.category))].filter(Boolean),
+        likeCount: 0,
+        commentCount: comments.filter((c) => c.postId === postId).length,
+        liked: false,
+        saved: PRESET_SAVED.has(postId),
+        alerted: PRESET_ALERTED.has(postId),
+        followingAuthor: false,
+        mine: false,
+        createdAt: start ? iso(new Date(start)) : hoursAgo(24),
+      }
+    })
+}
+
+let sheetLoading = null
+
+/** 첫 요청 때 한 번만 시트를 읽는다. 실패하면 조용히 SHEET 표를 그대로 쓴다. */
+function loadSheet() {
+  if (!sheetLoading) {
+    sheetLoading = fetch(SHEET_CSV_URL)
+      .then((res) => (res.ok ? res.text() : Promise.reject(new Error(`sheet ${res.status}`))))
+      .then((csv) => {
+        const fromSheet = postsFromSheet(csv)
+        if (!fromSheet.length) return
+        posts = fromSheet
+        nextPostId = Math.max(nextPostId, fromSheet.length + 100)
+      })
+      .catch((err) => {
+        if (import.meta.env.DEV) console.warn('[mock] 시트를 읽지 못해 내장 데이터로 동작합니다.', err)
+      })
+  }
+  return sheetLoading
+}
+
 export async function mockRequest(path, { method = 'GET', params, body } = {}) {
-  await delay()
+  await Promise.all([delay(), loadSheet()])
   const [pathname] = path.split('?')
   const seg = pathname.replace(/^\/api\/?/, '').split('/').filter(Boolean)
   const p = (i) => seg[i]
